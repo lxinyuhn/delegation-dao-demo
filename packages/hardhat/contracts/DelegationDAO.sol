@@ -3,17 +3,13 @@
 pragma solidity >=0.8.0;
 
 import "./StakingInterface.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
 
-contract DelegationDAO is AccessControl {
+contract DelegationDAO {
 
     using SafeMath for uint256;
     
-    // Role definition for contract members
-    bytes32 public constant MEMBER = keccak256("MEMBER");
-
     // Possible states for the DAO to be in:
     // COLLECTING: the DAO is collecting funds before creating a delegation once the minimum delegation stake has been reached
     // STAKING: the DAO has an active delegation
@@ -43,6 +39,15 @@ contract DelegationDAO is AccessControl {
     // The collator that this DAO is currently nominating
     address public target;
 
+    bool public revokeState;
+    address[] public revokeVoter;
+    uint256 public totalRevokeVote;
+
+    bool public resetState;
+    address[] public resetVoter;
+    uint256 public totalResetVote;
+
+
     // Event for a member deposit
     event deposit(address indexed _from, uint _value);
 
@@ -50,51 +55,20 @@ contract DelegationDAO is AccessControl {
     event withdrawal(address indexed _from, address indexed _to, uint _value);
 
     // Initialize a new DelegationDao dedicated to delegating to the given collator target.
-    constructor(address _target, address admin) {
+    constructor(address _target) {
         
         //Sets the collator that this DAO nominating
         target = _target;
         
         // Initializes Moonbeam's parachain staking precompile
         staking = ParachainStaking(stakingPrecompileAddress);
-        
-        //Initializes Roles
-        _setupRole(DEFAULT_ADMIN_ROLE, admin);
-        _setupRole(MEMBER, admin);
 
         //Initialize the DAO state
-        currentState = daoState.COLLECTING;
-        
-    }
-
-    // Grant a user the role of admin
-    function grant_admin(address newAdmin)
-        public
-        onlyRole(DEFAULT_ADMIN_ROLE)
-        onlyRole(MEMBER)
-    {
-        grantRole(DEFAULT_ADMIN_ROLE, newAdmin);
-        grantRole(MEMBER, newAdmin);
-    }
-
-    // Grant a user membership
-    function grant_member(address newMember)
-        public
-        onlyRole(DEFAULT_ADMIN_ROLE)
-    {
-        grantRole(MEMBER, newMember);
-    }
-
-    // Revoke a user membership
-    function remove_member(address payable exMember)
-        public
-        onlyRole(DEFAULT_ADMIN_ROLE)
-    {
-        revokeRole(MEMBER, exMember);
+        currentState = daoState.COLLECTING;        
     }
 
     // Increase member stake via a payable function and automatically stake the added amount if possible
-    function add_stake() external payable onlyRole(MEMBER) {
+    function add_stake() external payable {
         if (currentState == daoState.STAKING ) {
             // Sanity check
             if(!staking.is_delegator(address(this))){
@@ -115,6 +89,7 @@ contract DelegationDAO is AccessControl {
                 //initialiate the delegation and change the state          
                 staking.delegate(target, address(this).balance, staking.candidate_delegation_count(target), staking.delegator_delegation_count(address(this)));
                 currentState = daoState.STAKING;
+                reset_vote();
             }
         }
         else {
@@ -123,7 +98,7 @@ contract DelegationDAO is AccessControl {
     }
 
     // Function for a user to withdraw their stake
-    function withdraw(address payable account) public onlyRole(MEMBER) {
+    function withdraw(address payable account) public {
         require(currentState != daoState.STAKING, "The DAO is not in the correct state to withdraw.");
         if (currentState == daoState.REVOKING) {
             bool result = execute_revoke();
@@ -148,15 +123,41 @@ contract DelegationDAO is AccessControl {
         }
     }
 
+    function indexOf(address[] memory arr, address searchFor) private pure returns(int) {
+        for (uint i = 0; i < arr.length; i++) {
+            if (arr[i] == searchFor) {
+                return int(i);
+            }
+        }
+        return int(-1); // not found
+    }    
+
+    function vote_revoke() public {
+        require(currentState == daoState.REVOKING, "msg: state err");
+        require(indexOf(revokeVoter, msg.sender) < 0, "msg: Voted");
+        require(memberStakes[msg.sender] > 0, "msg: zero token");
+
+        revokeVoter.push(msg.sender);
+        totalRevokeVote = totalRevokeVote.add(memberStakes[msg.sender]);
+
+        if (totalRevokeVote > totalStake.sub(2)){
+            revokeState = true;
+            schedule_revoke();
+            revokeState = false;
+            delete revokeVoter;
+            totalRevokeVote = 0;               
+        }
+    }
+
     // Schedule revoke, admin only
-    function schedule_revoke() public onlyRole(DEFAULT_ADMIN_ROLE){
+    function schedule_revoke() internal {
         require(currentState == daoState.STAKING, "The DAO is not in the correct state to schedule a revoke.");
         staking.schedule_revoke_delegation(target);
-        currentState = daoState.REVOKING;
+        currentState = daoState.REVOKING;      
     }
     
     // Try to execute the revoke, returns true if it succeeds, false if it doesn't
-    function execute_revoke() internal onlyRole(MEMBER) returns(bool) {
+    function execute_revoke() internal returns(bool) {
         require(currentState == daoState.REVOKING, "The DAO is not in the correct state to execute a revoke.");
         staking.execute_delegation_request(address(this), target);
         if (staking.is_delegator(address(this))){
@@ -168,20 +169,45 @@ contract DelegationDAO is AccessControl {
     }
 
     // Check how much free balance the DAO currently has. It should be the staking rewards if the DAO state is anything other than REVOKED or COLLECTING. 
-    function check_free_balance() public view onlyRole(MEMBER) returns(uint256) {
+    function check_free_balance() public view returns(uint256) {
         return address(this).balance;
     }
     
-    // Change the collator target, admin only
-    function change_target(address newCollator) public onlyRole(DEFAULT_ADMIN_ROLE) {
+    // // Change the collator target, admin only
+    // function change_target(address newCollator) public onlyGovernance {
+    //     require(currentState == daoState.REVOKED || currentState == daoState.COLLECTING, "The DAO is not in the correct state to change staking target.");
+    //     target = newCollator;
+    // }
+
+
+    function vote_reset() public {
         require(currentState == daoState.REVOKED || currentState == daoState.COLLECTING, "The DAO is not in the correct state to change staking target.");
-        target = newCollator;
-    }
+        require(indexOf(resetVoter, msg.sender) < 0, "msg: Voted");
+        require(memberStakes[msg.sender] > 0, "msg: zero token");
+        resetVoter.push(msg.sender);
+        totalResetVote = totalResetVote.add(memberStakes[msg.sender]);
+
+        if (totalResetVote > totalStake.sub(2)){
+            resetState = true;
+            reset_dao();
+            resetState = false;
+            delete resetVoter;
+            totalResetVote = 0;  
+        }
+    }    
 
     // Reset the DAO state back to COLLECTING, admin only
-    function reset_dao() public onlyRole(DEFAULT_ADMIN_ROLE) {
+    function reset_dao() internal {
         currentState = daoState.COLLECTING;
     }
 
+    function reset_vote() internal {
+        resetState = false;
+        delete resetVoter;
+        totalResetVote = 0;  
+        revokeState = false;
+        delete revokeVoter;
+        totalRevokeVote = 0;                          
+    }
 
 }
